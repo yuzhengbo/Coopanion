@@ -32,6 +32,7 @@ git submodule update --init --recursive
 | `pnpm run typecheck` | 检查 Core 与 Electron 部分的类型 |
 | `pnpm run typecheck:web` | 检查设置窗口(`console/`)的类型 |
 | `pnpm run build:installer` | Windows 上打出 `dist/Coopanion-Setup-<版本>.exe`,设 `COOPANION_CHANNEL=portable` 时打出便携版 `dist/Coopanion-<版本>-win-x64-portable.zip`;Mac 上打出 `dist/Coopanion-<版本>-mac-<架构>.dmg` 和 `.zip`(`PACK_ARCH=x64` 在 Apple 芯片上打 Intel 版) |
+| `pnpm run build:local` | 在 `dist/Coopanion-local` 打出可直接运行的免安装目录(只 Windows):重打只替换程序文件,目录里的 `data\` 保留,升级不丢数据 |
 | `pnpm run build:icons` | 用桌宠的造型重画应用图标和默认头像 |
 
 想用一份干净的数据测试(比如看首次启动、引导、没填 Key 时的提醒),把 `CORTICO_COMPANION_DATA` 指向一个空目录再启动:
