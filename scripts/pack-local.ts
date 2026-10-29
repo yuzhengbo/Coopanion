@@ -12,10 +12,11 @@
  * 1. Electron is unpacked here, into `build/cache/`, and handed to electron-builder as `electronDist`.
  *    Its own unpack renames the extracted directory right after extraction, which the filter still
  *    holds open.
- * 2. The payload is copied in by Git Bash's `cp`, not by this process. Node writes through the filter
- *    (ciphertext on disk) and so do PowerShell and robocopy, whose copies of an encrypted file stay
- *    unreadable to the app's own exe; `cp` decrypts on read and writes plaintext. `verify` runs that
- *    exe over the copy before this exits.
+ * 2. The payload is copied in by Python, not by this process. Electron-builder rewrites the
+ *    dependency `package.json` files as it packages, and those rewritten files are ciphertext on disk
+ *    (the filter encrypts what node writes); a raw `cp` or robocopy carries the ciphertext into the copy
+ *    and the app's Core then fails to import any of them. Python reads through the filter and writes
+ *    plaintext. `verify` runs the app's own exe over the copy before this exits.
  */
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -56,22 +57,6 @@ const run = (cmd: string, args: string[], env: NodeJS.ProcessEnv = {}) => {
 
 const powershell = (script: string) =>
   spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { cwd: ROOT, encoding: 'utf8' });
-
-/** The bash Git for Windows installs, for the copy; null when there is none. */
-function gitBash(): string | null {
-  if (spawnSync('bash', ['-c', 'command -v cp'], { encoding: 'utf8' }).status === 0) return 'bash';
-  for (const base of [process.env.ProgramFiles, process.env['ProgramFiles(x86)'], process.env.LOCALAPPDATA]) {
-    if (!base) continue;
-    for (const dir of ['Git/bin/bash.exe', 'Programs/Git/bin/bash.exe']) {
-      const path = join(base, dir);
-      if (existsSync(path)) return path;
-    }
-  }
-  return null;
-}
-
-/** A path as git bash takes it: forward slashes, single-quoted. */
-const bashPath = (path: string) => `'${path.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`;
 
 /** The electron-builder.yml value the cached Electron has to match. */
 function electronVersion(): string {
@@ -131,19 +116,42 @@ function clear(): void {
   }
 }
 
-/** Copies the payload in through `cp`, which writes what the filter lets the app read back (see the header). */
+/** Copies the payload in through Python: it reads through the filter and writes what the app can read back. */
 function copy(): void {
-  const shell = gitBash() ?? fail('找不到 Git Bash：脚本用它的 cp 复制文件（PowerShell 和 robocopy 的副本应用读不了）');
-  const r = spawnSync(shell, ['-c', `cp -a ${bashPath(STAGE)}/. ${bashPath(TARGET)}/`],
-    { cwd: ROOT, encoding: 'utf8' });
-  if (r.status !== 0) fail(`复制失败：${r.stderr?.trim() || `退出码 ${r.status}`}`);
+  const script = [
+    'import shutil',
+    `shutil.copytree(${JSON.stringify(STAGE)}, ${JSON.stringify(TARGET)}, dirs_exist_ok=True)`,
+  ].join('\n');
+  const r = spawnSync('python', ['-c', script], { cwd: ROOT, encoding: 'utf8' });
+  if (r.error || r.status !== 0) {
+    fail(`复制失败：${r.error?.message ?? r.stderr?.trim() ?? `退出码 ${r.status}`}\n`
+      + '需要 Python 3：本进程和 cp 复制出来的文件在磁盘上是密文，应用读不到。');
+  }
 }
 
-/** Runs the copied exe over a sample of the payload: a ciphertext copy reads a different length. */
+/** The dependency manifests electron-builder rewrites: the files that break first when copied raw. */
+function manifests(): string[] {
+  const base = join(TARGET, 'resources', 'app', 'node_modules');
+  const out: string[] = [];
+  const walk = (dir: string, depth: number) => {
+    if (!existsSync(dir)) return;
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const path = join(dir, entry.name);
+      const manifest = join(path, 'package.json');
+      if (existsSync(manifest)) out.push(manifest);
+      else if (depth > 0) walk(path, depth - 1);
+    }
+  };
+  walk(base, 1);
+  return out;
+}
+
+/** Runs the copied exe over the payload: a ciphertext copy reads a different length. */
 function verify(): void {
   const exe = join(TARGET, 'Coopanion.exe');
   if (!existsSync(exe)) fail('复制不完整：没有 Coopanion.exe');
-  const files = SAMPLES.map((rel) => join(TARGET, rel)).filter(existsSync);
+  const files = [...SAMPLES.map((rel) => join(TARGET, rel)), ...manifests()].filter(existsSync);
   if (files.length < 4) fail('复制不完整：缺少数个应用文件');
   const script = "const fs=require('node:fs');console.log(process.argv.slice(1).map((p)=>{try{return fs.readFileSync(p).length}catch{return 'unreadable'}}).join(','))";
   const r = spawnSync(exe, ['-e', script, ...files], { encoding: 'utf8', env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } });
@@ -153,7 +161,7 @@ function verify(): void {
     fail(`应用读不到自己的文件：${wrong.map((f) => f.slice(TARGET.length + 1)).join('、')}\n`
       + '复制出来的文件在磁盘上是密文。把 dist/Coopanion-local 加入加密软件的例外目录再重跑。');
   }
-  say(`校验通过：应用能读到 ${files.length} 个抽样文件`);
+  say(`校验通过：应用能读到 ${files.length} 个文件（含全部依赖清单）`);
 }
 
 function cleanup(): void {
